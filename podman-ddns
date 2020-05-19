@@ -1,0 +1,193 @@
+#!/usr/bin/python
+
+import argparse
+import collections
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+#
+# SystemdNotifier
+#
+
+class SystemdNotifier(threading.Thread):
+    def __init__(self, notify_socket):
+        super().__init__(daemon=True)
+        self.path = notify_socket
+        self.queue = []
+        self.start()
+
+    def poison_pill(self):
+        self.queue.append('STOP')
+
+    def ready(self):
+        self.queue.append('READY=1')
+
+    def status(self, text):
+        self.queue.append(f"STATUS={text}")
+
+    def send(self, msg):
+        print(f"sending systemd notify message {msg!r}", flush=True)
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sock.connect(self.path)
+            sock.sendall(msg.encode('ascii'))
+            sock.close()
+        except:
+            print(f"warning: could not connect to unix dgram socket at {self.path} to do systemd ready notification", flush=True)
+
+    def run(self):
+        while True:
+            time.sleep(1.0)
+            if not self.queue:
+                continue
+            if (msg := self.queue.pop(0)) == 'STOP':
+                break
+            else:
+                self.send(msg)
+
+#
+# DNS functions
+#
+
+class DNS:
+    RR = collections.namedtuple('RR', 'name ttl class_ type value')
+
+    def __init__(self, zone_name, reverse_zones, server, key_file, key):
+        self.zone = zone_name
+        self.reverse_zones = reverse_zones
+        self.server = server
+        self.key = (key_file and ['-k', key_file]) or (key and ['-y', key]) or []
+
+    def get_AXFR(self, zone=None):
+        proc = subprocess.run(['dig'] + self.key + ['+noall', '+answer', zone or self.zone, 'AXFR', f"@{self.server}"], stdout=subprocess.PIPE, check=True, encoding='utf8')
+        return [DNS.RR._make(row.split(maxsplit=4)) for row in proc.stdout.split('\n') if row]
+
+    def del_RRs(self, rrs):
+        for rr in rrs: print(f"removing record: {' '.join(map(str, rr))}", flush=True)
+        script = {f"update del {name} {class_} {type}" for (name, class_, type) in sorted(rrs)}
+        if script:
+            script = [f"server {self.server}"] + ['check-names off'] + [*script] + ['send'] + ['']
+            subprocess.run(['nsupdate'] + self.key, input='\n'.join(script), check=True, encoding='utf8')
+
+    def add_RRs(self, rrs):
+        for rr in rrs: print(f"adding record: {' '.join(map(str, rr))}", flush=True)
+        script = [f"update add {name} {ttl} {class_} {type} {value}" for (name, ttl, class_, type, value) in sorted(rrs)]
+        if script:
+            script = [f"server {self.server}"] + ['check-names off'] + [*script] + ['send'] + ['']
+            subprocess.run(['nsupdate'] + self.key, input='\n'.join(script), check=True, encoding='utf8')
+
+    @staticmethod
+    def reverse_name(ip):
+        return '.'.join(reversed(ip.split('.'))) + '.in-addr.arpa.'
+
+#
+# Podman functions
+# XXX: most of this should also basically work for docker
+#
+
+def get_podman_container_events():
+    proc = subprocess.Popen(['podman', 'events', '--format', 'json', '--filter', 'type=container'], stdout=subprocess.PIPE, encoding='utf8')
+    return (json.loads(event) for event in proc.stdout)
+
+def get_podman_container_names():
+    proc = subprocess.run(['podman', 'container', 'ls', '--format', 'json'], stdout=subprocess.PIPE, check=True, encoding='utf8')
+    return [ctr['Names'] for ctr in json.loads(proc.stdout)]
+
+def get_podman_container_info(container_name):
+    proc = subprocess.run(['podman', 'container', 'inspect', '--format', 'json', container_name], stdout=subprocess.PIPE, check=True, encoding='utf8')
+    return json.loads(proc.stdout)
+
+def get_podman_container_ips(container_name):
+    info = get_podman_container_info(container_name)
+    if 'Networks' in info[0]['NetworkSettings']:
+        return [(net['NetworkID'], net['IPAddress']) for net in info[0]['NetworkSettings']['Networks'].values()]
+    else:
+        return [('default', info[0]['NetworkSettings']['IPAddress'])]
+
+#
+# Main functions
+#
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description='Registers container IPs in an RFC2136 dynamic DNS zone')
+    parser.add_argument('zone', help='Zone in which to register names')
+    parser.add_argument('-s', '--server', required=True, help='Server to register names with')
+    parser.add_argument('-r', '--reverse', nargs='+', help='Name of reverse zone(s)')
+    key = parser.add_mutually_exclusive_group()
+    key.add_argument('-k', '--key-file', help='Key file to use for dig/nsupdate TSIG signing')
+    key.add_argument('-y', '--key', help='Shared secret to use for dig/nsupdate TSIG signing')
+    return parser.parse_args(argv)
+
+def main(argv, env):
+    # sanity check for some executables
+    for name in ['podman', 'dig', 'nsupdate']:
+        if not shutil.which(name):
+            raise Exception(f"can't find executable '{name}' on $PATH")
+
+    # parse arguments
+    args = parse_args(argv[1:])
+    print(f"podman-ddns.py starting, arguments: {args!r}", flush=True)
+    if not args.zone.endswith('.'):
+        raise ValueError(f"zone name {args.zone!r} does not end with a '.'")
+    for rev in args.reverse:
+        if not rev.endswith('.in-addr.arpa.'):
+            raise ValueError(f"bad reverse zone {rev!r}")
+    dns = DNS(args.zone, args.reverse, args.server, args.key_file, args.key)
+
+    # remove any existing names from zones, and (re-)add currently running containers
+    axfr = dns.get_AXFR()
+    dns.del_RRs([(r1.name, 'IN', 'A') for r1 in axfr
+                 if r1.type == 'A' and not any(r2.type == 'NS' and r2.value == r1.name for r2 in axfr)])
+    for rev_zone in args.reverse:
+        dns.del_RRs([(r.name, 'IN', 'PTR')
+                     for r in dns.get_AXFR(rev_zone)
+                     if r.value.endswith(f".{args.zone}")])
+
+    # add currently running containers
+    ctrs = {name: get_podman_container_ips(name) for name in get_podman_container_names()}
+    dns.add_RRs([(f"{name}.{net}.{args.zone}", 30, 'IN', 'A', ip) for name in ctrs for (net, ip) in ctrs[name]])
+    for rev_zone in args.reverse:
+        dns.add_RRs([(DNS.reverse_name(ip), 30, 'IN', 'PTR', f"{name}.{net}.{args.zone}")
+                     for name in ctrs
+                     for (net, ip) in ctrs[name]
+                     if DNS.reverse_name(ip).endswith(f".{rev_zone}")])
+
+    # notify systemd that this program is now ready
+    # XXX: it's actually a race condition with having the podman events stream up and running, but there's a 1-second delay here, so it should mostly be fine
+    # XXX: the best way is probably to have the podman events running in a separate thread and do the notify from the main thread after making sure it's running?
+    if 'NOTIFY_SOCKET' in env:
+        notifier = SystemdNotifier(env['NOTIFY_SOCKET'])
+        notifier.ready()
+        notifier.poison_pill()
+
+    # watch for podman events and send 'add'/'del' updates to DNS server as appropriate
+    # XXX: should maybe batch updates somehow
+    for event in get_podman_container_events():
+        if event['Status'] == 'start':
+            try:
+                ips = get_podman_container_ips(event['Name'])
+            except subprocess.CalledProcessError:
+                continue
+            dns.add_RRs([(f"{event['Name']}.{net}.{args.zone}", 30, 'IN', 'A', ip) for (net, ip) in ips])
+            dns.add_RRs([(DNS.reverse_name(ip), 30, 'IN', 'PTR', f"{event['Name']}.{net}.{args.zone}")
+                         for (net, ip) in ips
+                         if any(reverse_name(ip).endswith(f".{rev_zone}") for rev_zone in args.reverse)])
+        elif event['Status'] == 'died':
+            axfr = dns.get_AXFR()
+            dns.del_RRs([(rr.name, rr.class_, rr.type)
+                         for rr in axfr
+                         if rr.type == 'A' and rr.name.startswith(f"{event['Name']}.") and rr.name.endswith(f".{args.zone}")])
+            dns.del_RRs([(rr.name, rr.class_, rr.type)
+                         for rev_zone in args.reverse
+                         for rr in dns.get_AXFR(rev_zone)
+                         if rr.type == 'PTR' and rr.value.startswith(f"{event['Name']}.") and rr.value.endswith(f".{args.zone}")])
+
+# FIXME: no unit tests, at all. will require a lot of mocking and duck-punching as well
+if __name__ == '__main__':
+    main(sys.argv, os.environ)
