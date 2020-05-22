@@ -116,7 +116,7 @@ def get_podman_container_ips(container_name):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='Registers container IPs in an RFC2136 dynamic DNS zone')
-    parser.add_argument('zone', help='Zone in which to register names')
+    parser.add_argument('-z', '--zone', required=True, help='Zone in which to register names')
     parser.add_argument('-s', '--server', required=True, help='Server to register names with')
     parser.add_argument('-r', '--reverse', action='append',
                         type=lambda s: (lambda zone, net: (zone, ipaddress.ip_network(net)))(*s.split(':', maxsplit=1)),
