@@ -59,9 +59,8 @@ class SystemdNotifier(threading.Thread):
 class DNS:
     RR = collections.namedtuple('RR', 'name ttl class_ type value')
 
-    def __init__(self, zone_name, reverse_zones, server, key_file, key):
+    def __init__(self, zone_name, server, key_file, key):
         self.zone = zone_name
-        self.reverse_zones = reverse_zones
         self.server = server
         self.key = (key_file and ['-k', key_file]) or (key and ['-y', key]) or []
 
@@ -136,7 +135,9 @@ def main(argv, env):
     for rev in args.reverse:
         if not rev.endswith('.in-addr.arpa.'):
             raise ValueError(f"bad reverse zone {rev!r}")
-    dns = DNS(args.zone, args.reverse, args.server, args.key_file, args.key)
+
+    # initialize DNS client object
+    dns = DNS(args.zone, args.server, args.key_file, args.key)
 
     # remove any existing names from zones, and (re-)add currently running containers
     axfr = dns.get_AXFR()
