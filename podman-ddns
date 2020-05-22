@@ -126,7 +126,7 @@ def parse_args(argv):
     key.add_argument('-y', '--key', help='Shared secret to use for dig/nsupdate TSIG signing')
     return parser.parse_args(argv)
 
-def main(argv, env):
+def main(argv, env, V={4: 'A', 6: 'AAAA'}):
     # sanity check for some executables
     for name in ['podman', 'dig', 'nsupdate']:
         if not shutil.which(name):
@@ -140,14 +140,18 @@ def main(argv, env):
     for (rev_zone, rev_net) in args.reverse:
         if rev_net.version == 4 and not rev_zone.endswith('.in-addr.arpa.'):
             raise ValueError(f"bad IPv4 reverse zone {rev_zone!r} for network {rev_net}")
+        if rev_net.version == 6 and not rev_zone.endswith('.ip6.arpa.'):
+            raise ValueError(f"bad IPv6 reverse zone {rev_zone!r} for network {rev_net}")
 
     # initialize DNS client object
     dns = DNS(args.zone, args.server, args.key_file, args.key)
 
     # remove any existing names from zones
     axfr = dns.get_AXFR()
-    dns.del_RRs([(r1.name, 'IN', 'A') for r1 in axfr
-                 if r1.type == 'A' and not any(r2.type == 'NS' and r2.value == r1.name for r2 in axfr)])
+    dns.del_RRs([(r1.name, 'IN', type)
+                 for r1 in axfr
+                 for type in V.values()
+                 if r1.type == type and not any(r2.type == 'NS' and r2.value == r1.name for r2 in axfr)])
     for (rev_zone, _) in args.reverse:
         dns.del_RRs([(r.name, 'IN', 'PTR')
                      for r in dns.get_AXFR(rev_zone)
@@ -155,12 +159,14 @@ def main(argv, env):
 
     # add currently running containers
     ctrs = {name: [*get_podman_container_ips(name)] for name in get_podman_container_names()}
-    dns.add_RRs([(f"{name}.{net}.{args.zone}", 30, 'IN', 'A', ip) for name in ctrs for (net, ip) in ctrs[name]])
+    dns.add_RRs([(f"{name}.{net}.{args.zone}", 30, 'IN', V[ip.version], ip)
+                 for name in ctrs
+                 for (net, ip) in ctrs[name]])
     for (rev_zone, rev_net) in args.reverse:
         dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{name}.{net}.{args.zone}")
                      for name in ctrs
                      for (net, ip) in ctrs[name]
-                     if ip.reverse_pointer.endswith(f".{rev_zone}")])
+                     if ip.version == rev_net.version and ip in rev_net])
 
     # notify systemd that this program is now ready
     # XXX: it's actually a race condition with having the podman events stream up and running, but there's a 1-second delay here, so it should mostly be fine
@@ -176,14 +182,14 @@ def main(argv, env):
         if event['Status'] == 'start':
             if not (ips := [*get_podman_container_ips(event['Name'])]):
                 continue
-            dns.add_RRs([(f"{event['Name']}.{net}.{args.zone}", 30, 'IN', 'A', ip) for (net, ip) in ips])
+            dns.add_RRs([(f"{event['Name']}.{net}.{args.zone}", 30, 'IN', V[ip.version], ip)
+                         for (net, ip) in ips])
             dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{event['Name']}.{net}.{args.zone}")
                          for (net, ip) in ips
-                         if any(ip.reverse_pointer.endswith(f".{rev_zone}") for rev_zone in args.reverse)])
+                         if any(ip.version == rev_net.version and ip in rev_net for (_, rev_net) in args.reverse)])
         elif event['Status'] == 'died':
-            axfr = dns.get_AXFR()
             dns.del_RRs([(rr.name, rr.class_, rr.type)
-                         for rr in axfr
+                         for rr in dns.get_AXFR()
                          if rr.type == 'A' and rr.name.startswith(f"{event['Name']}.") and rr.name.endswith(f".{args.zone}")])
             dns.del_RRs([(rr.name, rr.class_, rr.type)
                          for (rev_zone, _) in args.reverse
