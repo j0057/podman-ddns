@@ -118,7 +118,9 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description='Registers container IPs in an RFC2136 dynamic DNS zone')
     parser.add_argument('zone', help='Zone in which to register names')
     parser.add_argument('-s', '--server', required=True, help='Server to register names with')
-    parser.add_argument('-r', '--reverse', nargs='+', help='Name of reverse zone(s)')
+    parser.add_argument('-r', '--reverse', action='append',
+                        type=lambda s: (lambda zone, net: (zone, ipaddress.ip_network(net)))(*s.split(':', maxsplit=1)),
+                        help='Description of reverse zone(s), example: 16.172.in-addr.arpa.:172.16.96.0/20')
     key = parser.add_mutually_exclusive_group()
     key.add_argument('-k', '--key-file', help='Key file to use for dig/nsupdate TSIG signing')
     key.add_argument('-y', '--key', help='Shared secret to use for dig/nsupdate TSIG signing')
@@ -135,18 +137,18 @@ def main(argv, env):
     print(f"podman-ddns.py starting, arguments: {args!r}", flush=True)
     if not args.zone.endswith('.'):
         raise ValueError(f"zone name {args.zone!r} does not end with a '.'")
-    for rev in args.reverse:
-        if not rev.endswith('.in-addr.arpa.'):
-            raise ValueError(f"bad reverse zone {rev!r}")
+    for (rev_zone, rev_net) in args.reverse:
+        if rev_net.version == 4 and not rev_zone.endswith('.in-addr.arpa.'):
+            raise ValueError(f"bad IPv4 reverse zone {rev_zone!r} for network {rev_net}")
 
     # initialize DNS client object
     dns = DNS(args.zone, args.server, args.key_file, args.key)
 
-    # remove any existing names from zones, and (re-)add currently running containers
+    # remove any existing names from zones
     axfr = dns.get_AXFR()
     dns.del_RRs([(r1.name, 'IN', 'A') for r1 in axfr
                  if r1.type == 'A' and not any(r2.type == 'NS' and r2.value == r1.name for r2 in axfr)])
-    for rev_zone in args.reverse:
+    for (rev_zone, _) in args.reverse:
         dns.del_RRs([(r.name, 'IN', 'PTR')
                      for r in dns.get_AXFR(rev_zone)
                      if r.value.endswith(f".{args.zone}")])
@@ -154,7 +156,7 @@ def main(argv, env):
     # add currently running containers
     ctrs = {name: [*get_podman_container_ips(name)] for name in get_podman_container_names()}
     dns.add_RRs([(f"{name}.{net}.{args.zone}", 30, 'IN', 'A', ip) for name in ctrs for (net, ip) in ctrs[name]])
-    for rev_zone in args.reverse:
+    for (rev_zone, rev_net) in args.reverse:
         dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{name}.{net}.{args.zone}")
                      for name in ctrs
                      for (net, ip) in ctrs[name]
@@ -184,7 +186,7 @@ def main(argv, env):
                          for rr in axfr
                          if rr.type == 'A' and rr.name.startswith(f"{event['Name']}.") and rr.name.endswith(f".{args.zone}")])
             dns.del_RRs([(rr.name, rr.class_, rr.type)
-                         for rev_zone in args.reverse
+                         for (rev_zone, _) in args.reverse
                          for rr in dns.get_AXFR(rev_zone)
                          if rr.type == 'PTR' and rr.value.startswith(f"{event['Name']}.") and rr.value.endswith(f".{args.zone}")])
 
