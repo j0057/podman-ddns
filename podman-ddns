@@ -100,7 +100,10 @@ def get_podman_container_info(container_name):
     return json.loads(proc.stdout)
 
 def get_podman_container_ips(container_name):
-    info = get_podman_container_info(container_name)
+    try:
+        info = get_podman_container_info(container_name)
+    except subprocess.CalledProcessError:
+        return None
     for net in info[0]['NetworkSettings'].get('Networks', {'default': info[0]['NetworkSettings']}).values():
         if net['IPAddress']:
             yield (net.get('NetworkID', 'default'), ipaddress.ip_address(net['IPAddress']))
@@ -169,9 +172,7 @@ def main(argv, env):
     # XXX: should maybe batch updates somehow
     for event in get_podman_container_events():
         if event['Status'] == 'start':
-            try:
-                ips = [*get_podman_container_ips(event['Name'])]
-            except subprocess.CalledProcessError:
+            if not (ips := [*get_podman_container_ips(event['Name'])]):
                 continue
             dns.add_RRs([(f"{event['Name']}.{net}.{args.zone}", 30, 'IN', 'A', ip) for (net, ip) in ips])
             dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{event['Name']}.{net}.{args.zone}")
