@@ -166,7 +166,7 @@ def main(argv, env, V={4: 'A', 6: 'AAAA'}):
         dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{name}.{net}.{args.zone}")
                      for name in ctrs
                      for (net, ip) in ctrs[name]
-                     if ip.version == rev_net.version and ip in rev_net])
+                     if ip in rev_net])
 
     # notify systemd that this program is now ready
     # XXX: it's actually a race condition with having the podman events stream up and running, but there's a 1-second delay here, so it should mostly be fine
@@ -184,9 +184,10 @@ def main(argv, env, V={4: 'A', 6: 'AAAA'}):
                 continue
             dns.add_RRs([(f"{event['Name']}.{net}.{args.zone}", 30, 'IN', V[ip.version], ip)
                          for (net, ip) in ips])
-            dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{event['Name']}.{net}.{args.zone}")
-                         for (net, ip) in ips
-                         if any(ip.version == rev_net.version and ip in rev_net for (_, rev_net) in args.reverse)])
+            for (_, rev_net) in args.reverse:
+                dns.add_RRs([(ip.reverse_pointer, 30, 'IN', 'PTR', f"{event['Name']}.{net}.{args.zone}")
+                            for (net, ip) in ips
+                            if ip in rev_net])
         elif event['Status'] == 'died':
             dns.del_RRs([(rr.name, rr.class_, rr.type)
                          for rr in dns.get_AXFR()
