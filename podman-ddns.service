@@ -1,0 +1,11 @@
+[Unit]
+Description=Podman DDNS syncer
+
+[Service]
+Type=notify
+ExecStart=/bin/sh -c 'exec podman-ddns -k ${PODMAN_DDNS_KEYFILE} -s ${PODMAN_DDNS_SERVER} -r ${PODMAN_DDNS_REVERSE} -- ${PODMAN_DDNS_DOMAIN}'
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target
