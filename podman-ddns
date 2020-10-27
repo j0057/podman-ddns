@@ -91,6 +91,17 @@ def get_podman_container_events():
     proc = subprocess.Popen(['podman', 'events', '--format', 'json', '--filter', 'type=container'], stdout=subprocess.PIPE, encoding='utf8')
     return (json.loads(event) for event in proc.stdout)
 
+def get_journald_container_events():
+    proc = subprocess.Popen(['journalctl', '--follow', '--output=json', '--since=now', 'PODMAN_TYPE=container'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding='utf8')
+    for event_json in proc.stdout:
+        try:
+            event = json.loads(event_json)
+        except json.decoder.JSONDecodeError:
+            print(f"Could not parse journal event: {event_json!r}")
+            continue
+        if event['PODMAN_EVENT'] in {'start', 'died'}:
+            yield {'Name': event['PODMAN_NAME'], 'Status': event['PODMAN_EVENT']}
+
 def get_podman_container_names():
     proc = subprocess.run(['podman', 'container', 'ls', '--format', 'json'], stdout=subprocess.PIPE, check=True, encoding='utf8')
     return [ctr['Names'][0] for ctr in json.loads(proc.stdout)]
@@ -178,7 +189,7 @@ def main(argv, env, V={4: 'A', 6: 'AAAA'}):
 
     # watch for podman events and send 'add'/'del' updates to DNS server as appropriate
     # XXX: should maybe batch updates somehow
-    for event in get_podman_container_events():
+    for event in get_journald_container_events():
         if event['Status'] == 'start':
             if not (ips := [*get_podman_container_ips(event['Name'])]):
                 continue
