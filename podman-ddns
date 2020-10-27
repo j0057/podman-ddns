@@ -93,7 +93,7 @@ def get_podman_container_events():
 
 def get_podman_container_names():
     proc = subprocess.run(['podman', 'container', 'ls', '--format', 'json'], stdout=subprocess.PIPE, check=True, encoding='utf8')
-    return [ctr['Names'] for ctr in json.loads(proc.stdout)]
+    return [ctr['Names'][0] for ctr in json.loads(proc.stdout)]
 
 def get_podman_container_info(container_name):
     proc = subprocess.run(['podman', 'container', 'inspect', '--format', 'json', container_name], stdout=subprocess.PIPE, check=True, encoding='utf8')
